@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gravity Simulator</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #10131a; color: #eee; display: flex; flex-direction: column; height: 100vh; }
+  #panel { background: #1b2030; padding: 10px 14px; display: flex; flex-direction: column; gap: 10px; max-height: 50vh; overflow-y: auto; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .tag { font-size: 12px; opacity: .65; margin-right: 4px; }
+  #sliders { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px 18px; }
+  #sliders label { display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
+  #sliders .top { display: flex; justify-content: space-between; }
+  button { background: #3b4468; color: #fff; border: 0; padding: 7px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  button:hover { background: #4f5a8a; }
+  button.active { background: #e0603a; }
+  #wrap { flex: 1; position: relative; min-height: 200px; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; touch-action: none; }
+</style>
+</head>
+<body>
+<div id="panel">
+  <div class="row" id="presets"><span class="tag">Presets</span></div>
+  <div class="row" id="actions"><span class="tag">Actions</span></div>
+  <div id="sliders"></div>
+</div>
+<div id="wrap"><canvas id="c"></canvas></div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0;
+function resize() {
+  const r = canvas.getBoundingClientRect();
+  W = canvas.width = r.width;
+  H = canvas.height = r.height;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const K = 0.5;               // pixels per frame^2 at 1 g
+const WALL_FRICTION = 0.98;
+const s = { strength: 1, speed: 1, angle: 90, bounce: 0.6, drag: 0.01, wind: 0, size: 40, pull: 1 };
+const defaults = Object.assign({}, s);
+let anti = false, paused = false, held = null, offX = 0, offY = 0;
+let clickMode = 0, trails = false, collisionsOn = true, pointerDown = false, ptr = { x: 0, y: 0 };
+const blocks = [];
+
+// ---------- sliders ----------
+const defs = [
+  { key: 'strength', label: 'Gravity strength', min: 0, max: 10, step: 0.01, fmt: v => v.toFixed(2) + ' g' },
+  { key: 'speed', label: 'Gravity speed (time scale)', min: 0.1, max: 3, step: 0.05, fmt: v => v.toFixed(2) + 'x' },
+  { key: 'angle', label: 'Gravity direction (90 = down)', min: 0, max: 360, step: 1, fmt: v => v + ' deg' },
+  { key: 'bounce', label: 'Bounciness', min: 0, max: 1, step: 0.01, fmt: v => v.toFixed(2) },
+  { key: 'drag', label: 'Air drag', min: 0, max: 0.2, step: 0.005, fmt: v => v.toFixed(3) },
+  { key: 'wind', label: 'Wind (left / right)', min: -5, max: 5, step: 0.1, fmt: v => v.toFixed(1) },
+  { key: 'size', label: 'Block size (next block)', min: 15, max: 120, step: 1, fmt: v => v + ' px' },
+  { key: 'pull', label: 'Attract / repel strength', min: 0, max: 5, step: 0.1, fmt: v => v.toFixed(1) }
+];
+const ui = {};
+const sliderBox = document.getElementById('sliders');
+defs.forEach(d => {
+  const label = document.createElement('label');
+  const top = document.createElement('div');
+  top.className = 'top';
+  const name = document.createElement('span');
+  name.textContent = d.label;
+  const out = document.createElement('span');
+  top.append(name, out);
+  const input = document.createElement('input');
+  input.type = 'range';
+  input.min = d.min; input.max = d.max; input.step = d.step; input.value = s[d.key];
+  label.append(top, input);
+  sliderBox.appendChild(label);
+  ui[d.key] = { input, out, fmt: d.fmt };
+  out.textContent = d.fmt(s[d.key]);
+  input.addEventListener('input', () => setVal(d.key, parseFloat(input.value)));
+});
+function setVal(key, v) {
+  s[key] = v;
+  ui[key].input.value = v;
+  ui[key].out.textContent = ui[key].fmt(v);
+}
+
+// ---------- buttons ----------
+function btn(parent, text, fn) {
+  const b = document.createElement('button');
+  b.textContent = text;
+  b.onclick = () => fn(b);
+  parent.appendChild(b);
+  return b;
+}
+const presetRow = document.getElementById('presets');
+[['Moon (0.17 g)', 0.17], ['Mars (0.38 g)', 0.38], ['Earth (1 g)', 1],
+ ['Jupiter (2.5 g)', 2.5], ['Heavy (6 g)', 6], ['Zero g', 0]
+].forEach(([name, g]) => btn(presetRow, name, () => setVal('strength', g)));
+
+const actionRow = document.getElementById('actions');
+btn(actionRow, 'Anti-gravity: OFF', b => {
+  anti = !anti;
+  b.textContent = 'Anti-gravity: ' + (anti ? 'ON' : 'OFF');
+  b.classList.toggle('active', anti);
+});
+btn(actionRow, 'Click: Add block', b => {
+  clickMode = (clickMode + 1) % 3;
+  b.textContent = 'Click: ' + ['Add block', 'Attract', 'Repel'][clickMode];
+  b.classList.toggle('active', clickMode !== 0);
+});
+btn(actionRow, 'Trails: OFF', b => {
+  trails = !trails;
+  b.textContent = 'Trails: ' + (trails ? 'ON' : 'OFF');
+  b.classList.toggle('active', trails);
+});
+btn(actionRow, 'Collisions: ON', b => {
+  collisionsOn = !collisionsOn;
+  b.textContent = 'Collisions: ' + (collisionsOn ? 'ON' : 'OFF');
+  b.classList.toggle('active', !collisionsOn);
+});
+btn(actionRow, 'Pause', b => {
+  paused = !paused;
+  b.textContent = paused ? 'Resume' : 'Pause';
+  b.classList.toggle('active', paused);
+});
+btn(actionRow, 'Add 10', () => {
+  for (let i = 0; i < 10; i++) addBlock(Math.random() * W, Math.random() * H * 0.5);
+});
+btn(actionRow, 'Shake', () => {
+  blocks.forEach(b => { b.vx += (Math.random() - .5) * 20; b.vy += (Math.random() - .5) * 20; });
+});
+btn(actionRow, 'Clear', () => { blocks.length = 0; held = null; });
+btn(actionRow, 'Reset settings', () => {
+  Object.keys(defaults).forEach(k => setVal(k, defaults[k]));
+});
+
+// ---------- blocks ----------
+function clamp(v, lo, hi) { return Math.min(Math.max(v, lo), hi); }
+function addBlock(x, y) {
+  const size = s.size;
+  blocks.push({
+    x: clamp(x - size / 2, 0, Math.max(0, W - size)),
+    y: clamp(y - size / 2, 0, Math.max(0, H - size)),
+    w: size, h: size,
+    vx: (Math.random() - .5) * 4,
+    vy: 0,
+    color: 'hsl(' + Math.floor(Math.random() * 360) + ', 70%, 55%)'
+  });
+}
+
+// ---------- input: click empty space to add, drag a block to throw it ----------
+function pos(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+canvas.addEventListener('pointerdown', e => {
+  if (clickMode !== 0) { pointerDown = true; ptr = pos(e); canvas.setPointerCapture(e.pointerId); return; }
+  const p = pos(e);
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i];
+    if (p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h) {
+      held = b; offX = p.x - b.x; offY = p.y - b.y;
+      b.vx = 0; b.vy = 0;
+      canvas.setPointerCapture(e.pointerId);
+      return;
+    }
+  }
+  addBlock(p.x, p.y);
+});
+canvas.addEventListener('pointermove', e => {
+  if (pointerDown) ptr = pos(e);
+  if (!held) return;
+  const p = pos(e);
+  const nx = clamp(p.x - offX, 0, W - held.w);
+  const ny = clamp(p.y - offY, 0, H - held.h);
+  held.vx = (nx - held.x) * 0.5 + held.vx * 0.5;
+  held.vy = (ny - held.y) * 0.5 + held.vy * 0.5;
+  held.x = nx; held.y = ny;
+});
+const release = () => { held = null; pointerDown = false; };
+canvas.addEventListener('pointerup', release);
+canvas.addEventListener('pointercancel', release);
+
+// ---------- physics ----------
+function bounceAxis(v) { return Math.abs(v) < 0.4 ? 0 : -v * s.bounce; }
+function walls(b) {
+  if (b.y + b.h > H) { b.y = H - b.h; if (b.vy > 0) b.vy = bounceAxis(b.vy); b.vx *= WALL_FRICTION; }
+  if (b.y < 0)       { b.y = 0;       if (b.vy < 0) b.vy = bounceAxis(b.vy); b.vx *= WALL_FRICTION; }
+  if (b.x + b.w > W) { b.x = W - b.w; if (b.vx > 0) b.vx = bounceAxis(b.vx); b.vy *= WALL_FRICTION; }
+  if (b.x < 0)       { b.x = 0;       if (b.vx < 0) b.vx = bounceAxis(b.vx); b.vy *= WALL_FRICTION; }
+}
+function collide() {
+  for (let i = 0; i < blocks.length; i++) {
+    for (let j = i + 1; j < blocks.length; j++) {
+      const a = blocks[i], c = blocks[j];
+      if (a === held || c === held) continue;
+      const ox = Math.min(a.x + a.w, c.x + c.w) - Math.max(a.x, c.x);
+      const oy = Math.min(a.y + a.h, c.y + c.h) - Math.max(a.y, c.y);
+      if (ox > 0 && oy > 0) {
+        if (ox < oy) {
+          const push = ox / 2 * (a.x < c.x ? -1 : 1);
+          a.x += push; c.x -= push;
+          [a.vx, c.vx] = [c.vx * s.bounce, a.vx * s.bounce];
+        } else {
+          const push = oy / 2 * (a.y < c.y ? -1 : 1);
+          a.y += push; c.y -= push;
+          [a.vy, c.vy] = [c.vy * s.bounce, a.vy * s.bounce];
+        }
+      }
+    }
+  }
+}
+function step() {
+  if (paused) return;
+  const sign = anti ? -1 : 1;
+  const rad = s.angle * Math.PI / 180;
+  const ax = Math.cos(rad) * s.strength * K * sign + s.wind * 0.05;
+  const ay = Math.sin(rad) * s.strength * K * sign;
+  const n = Math.max(1, Math.ceil(s.speed));   // substeps keep fast speeds stable
+  const dt = s.speed / n;
+  for (let k = 0; k < n; k++) {
+    for (const b of blocks) {
+      if (b === held) continue;
+      if (pointerDown && clickMode !== 0) {
+        const px = ptr.x - (b.x + b.w / 2), py = ptr.y - (b.y + b.h / 2);
+        const d = Math.max(30, Math.hypot(px, py));
+        const f = s.pull * 60 / d * (clickMode === 1 ? 1 : -1) * dt;
+        b.vx += px / d * f;
+        b.vy += py / d * f;
+      }
+      b.vx += ax * dt;
+      b.vy += ay * dt;
+      const damp = Math.max(0, 1 - s.drag * dt);
+      b.vx *= damp; b.vy *= damp;
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      walls(b);
+    }
+    if (collisionsOn) collide();
+  }
+}
+
+// ---------- drawing ----------
+function drawArrow() {
+  if (s.strength === 0) return;
+  const rad = s.angle * Math.PI / 180;
+  const sign = anti ? -1 : 1;
+  const dx = Math.cos(rad) * sign, dy = Math.sin(rad) * sign;
+  const cx = W - 50, cy = 50;
+  const len = 16 + Math.min(s.strength, 6) * 4;
+  const x1 = cx - dx * len / 2, y1 = cy - dy * len / 2;
+  const x2 = cx + dx * len / 2, y2 = cy + dy * len / 2;
+  const a = Math.atan2(dy, dx);
+  ctx.strokeStyle = 'rgba(255,255,255,.7)';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+  ctx.moveTo(x2, y2); ctx.lineTo(x2 - 9 * Math.cos(a - 0.5), y2 - 9 * Math.sin(a - 0.5));
+  ctx.moveTo(x2, y2); ctx.lineTo(x2 - 9 * Math.cos(a + 0.5), y2 - 9 * Math.sin(a + 0.5));
+  ctx.stroke();
+}
+function draw() {
+  if (trails) { ctx.fillStyle = 'rgba(16, 19, 26, 0.18)'; ctx.fillRect(0, 0, W, H); }
+  else { ctx.clearRect(0, 0, W, H); }
+  for (const b of blocks) {
+    ctx.fillStyle = b.color;
+    ctx.fillRect(b.x, b.y, b.w, b.h);
+    ctx.strokeStyle = b === held ? '#fff' : 'rgba(255,255,255,.35)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(b.x, b.y, b.w, b.h);
+  }
+  ctx.fillStyle = 'rgba(255,255,255,.6)';
+  ctx.font = '14px system-ui';
+  ctx.fillText(s.strength.toFixed(2) + ' g' + (anti ? ' (anti-gravity)' : '') + '  |  speed ' + s.speed.toFixed(2) + 'x  |  blocks: ' + blocks.length, 12, 22);
+  drawArrow();
+  if (pointerDown && clickMode !== 0) {
+    ctx.strokeStyle = clickMode === 1 ? '#4fd1c5' : '#f6ad55';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(ptr.x, ptr.y, 18, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+}
+function loop() {
+  step();
+  draw();
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
